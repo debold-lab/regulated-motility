@@ -1,0 +1,192 @@
+---
+title: "Rabbit Regulated Motility"
+output: 
+  flexdashboard::flex_dashboard:
+    theme: flatly
+---
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+library(flexdashboard)
+library(googledrive)
+library(readxl)
+library(data.table)
+library(ggplot2)
+library(drc)
+library(reactable)
+library(sparkline)
+
+drive_auth("brentscott93@gmail.com", cache = ".secrets")
+
+mot_data <- drive_download("https://docs.google.com/spreadsheets/d/1u6UqkXUFKxWdt6S1wfXKFidYem-1kz-6/edit#gid=369763083",
+                           overwrite = TRUE)
+
+mot_data <- read_xlsx(mot_data$local_path) |> setDT()
+mot_control <- mot_data[, c(1, 13)]
+
+mot_data <- mot_data[!is.na(Date), 1:12]
+setnames(mot_data, c("pCa Values 4", "[ATP] (uM)"), c("4", "atp"))
+
+mot_data <- melt(mot_data, id.vars = 1:2, variable.name = "pCa", value.name = "velocity")
+mot_data$atp <- as.numeric(mot_data$atp)
+mot_data$pCa <- as.numeric(as.character(mot_data$pCa))
+
+mot_data_sum <- mot_data[, .(velocity_avg = mean(velocity, na.rm = T),
+                             velocity_sd = sd(velocity, na.rm = T),
+                             velocity_se = sd(velocity, na.rm = T)/sqrt(.N),
+                             n = .N),
+                         by =  .(atp, pCa)]
+
+mot_data_sum$pCa_factor <- factor(mot_data_sum$pCa, levels = sort(unique(mot_data_sum$pCa)))
+
+```
+
+
+Column {.tabset}
+-------------------------------------
+
+### All Data
+```{r}
+reactable(mot_data, groupBy = "Date", compact = T)
+```
+
+### Data Summary
+```{r}
+tab_sum <- mot_data_sum[, .(pCa,
+                            "[ATP]" = atp, 
+                            "Velocity (avg)" = velocity_avg, 
+                            "Velocity (se)" = velocity_se, 
+                            n)]
+ctr <- names(tab_sum)[3:4]
+tab_sum[,(ctr) := round(.SD,2), .SDcols=3:4]
+reactable(tab_sum,
+          groupBy = "pCa", 
+          defaultSorted = list(pCa = "asc"),
+          compact = T,
+          outlined = F)
+```
+
+
+Column 
+-------------------------------------
+
+### pCa vs Velocity
+
+```{r}
+
+pca_curve_data <- mot_data_sum
+pca_curve_data$atp_factor <- factor(pca_curve_data$atp, levels = sort(unique(pca_curve_data$atp), decreasing = TRUE))
+
+fit_hill <- function(x){
+  drm(velocity_avg ~ pCa, 
+      data = x, 
+      fct = LL.4(names = c("hillslope", "min", "vmax", "ec50")), 
+      logDose = 10)
+}
+
+predict_hill <- function(x){
+  dummy_x <- expand.grid(pCa=exp(seq(log(4), log(10), length=100)))
+  predict_y <- predict(x, newdata = dummy_x)
+  df <- data.frame(pCa = dummy_x,
+                   y = predict_y)
+}
+
+pca_nest <- pca_curve_data[, .(data = list(.SD)), by = .(atp_factor)]
+pca_nest[, hill_fit := lapply(data, fit_hill)]
+pca_nest[, predict_fit := lapply(hill_fit, predict_hill)]
+pca_nest[, mod_table := lapply(hill_fit, broom::tidy)]
+
+pca_lines <- pca_nest[, predict_fit[[1]], by = .(atp_factor)]
+
+gg2 <-
+ggplot()+
+  geom_jitter(data = pca_curve_data,
+              aes(x = pCa, 
+                  y = velocity_avg, 
+                  color = atp_factor),
+              alpha = 0.4,
+              size = 2)+
+  geom_line(data = pca_lines,
+            aes(x = pCa,
+                y = y, 
+                color = atp_factor))+
+  # geom_errorbar(aes( ymin = velocity_avg-velocity_se,
+  #                    ymax = velocity_avg+velocity_se), alpha = 0.5)+
+  xlab("pCa")+
+  ylab("Velocity (um/s)")+
+  scale_x_reverse()+
+   scale_color_manual("[ATP]", values = rainbow(length(unique(pca_curve_data$atp_factor))))+
+  #facet_wrap(~pCa, nrow = 2)+
+  theme_classic(12)
+
+plotly::ggplotly(gg2)
+```
+
+
+### Hill Fit Table
+```{r}
+mod_table <- pca_nest[, mod_table[[1]], by = .(atp_factor)]
+mod_table <- dcast(mod_table, atp_factor ~ term, value.var = "estimate")
+mod_table[, pCa50 := log10(ec50)]
+mod_table <- mod_table[, .(ATP = atp_factor, vmax, pCa50, hillslope, min)]
+cols <- names(mod_table)[2:5]
+mod_table[,(cols) := round(.SD,2), .SDcols=2:5]
+
+mod_spark <- pca_nest[, sparkline := lapply(hill_fit, function(x) rev(predict(x, newdata = data.frame(pCa=seq(4, 10, by = 0.01)))))] 
+mod_spark <- mod_spark[, .(ATP = atp_factor, sparkline)]
+
+tab <- merge(mod_table, mod_spark)
+reactable(data = tab, 
+          columns = list(
+                      sparkline = colDef(cell = function(value, index) {
+                                                   sparkline(tab$sparkline[[index]],
+                                                             chartRangeMin = min(tab$min), 
+                                                             chartRangeMax = max(tab$vmax))
+                                                    })
+))
+
+```
+
+Column
+-----------------------------------------
+
+### ATP vs Velocity
+```{r}
+
+gg1 <- 
+  ggplot(mot_data_sum, 
+       aes(x = atp, 
+           y = velocity_avg, 
+           color = pCa_factor))+
+  geom_point(alpha = 0.6, size = 2, shape = 16)+
+  geom_line(alpha = 0.4)+
+  ylab("Velocity (um/s)")+
+  xlab("[ATP] (uM)")+
+  # geom_errorbar(aes( ymin = velocity_avg-velocity_se,
+  #                    ymax = velocity_avg+velocity_se), alpha = 0.5)+
+  #scale_color_gradient(low = "green", high = "red")+
+  scale_color_manual("pCa", values = rainbow(length(unique(mot_data_sum$pCa_factor))))+
+  #facet_wrap(~pCa, nrow = 2, scales = "free")+
+  theme_classic(12)
+
+plotly::ggplotly(gg1)
+```
+
+### Control Data 
+
+```{r}
+mot_control <- mot_control[!is.na(Date), .(Velocity = mean(Control, na.rm = T)), by = "Date"]
+date_check <- unique(mot_control$Date)
+mot_control$Date <- factor(mot_control$Date, levels = date_check)
+
+gg3 <- 
+ggplot(mot_control)+
+  geom_col(aes(Date, Velocity), fill = "black", color = "white", size = 1, width = 0.75)+
+  scale_y_continuous(expand = expansion(c(0, 0.1)))+
+  ylab("Velocity (um/s)")+
+  theme_classic(12)
+
+plotly::ggplotly(gg3)
+```
+### Source {data-height=50}
+Data is pulled from [Google Drive](https://docs.google.com/spreadsheets/d/1u6UqkXUFKxWdt6S1wfXKFidYem-1kz-6/edit#gid=369763083)
+
